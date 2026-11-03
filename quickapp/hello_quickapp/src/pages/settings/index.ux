@@ -67,6 +67,30 @@
           </div>
         </div>
 
+        <!-- 设备绑定：序列号（后续可替换为二维码扫码绑定） -->
+        <div class="setting-item">
+          <text class="setting-label">设备序列号</text>
+          <input class="sn-input" type="text" placeholder="EH-WATCH-20260101" value="{{ deviceSnInput }}" onchange="onDeviceSnInput" />
+        </div>
+
+        <div class="setting-item">
+          <text class="setting-label">绑定状态</text>
+          <text class="mqtt-status {{ bindingBound ? 'mqtt-online' : 'mqtt-offline' }}">{{ bindingStatusText }}</text>
+        </div>
+
+        <div class="setting-item">
+          <text class="setting-label">序列号绑定</text>
+          <div class="setting-value-row">
+            <input type="button" class="cloud-btn" value="保存绑定" onclick="saveDeviceBinding" />
+            <input type="button" class="cloud-btn" value="恢复默认" onclick="resetDeviceBinding" />
+          </div>
+        </div>
+
+        <div class="setting-item">
+          <text class="setting-label">扫码绑定</text>
+          <input type="button" class="cloud-btn" value="扫二维码" onclick="scanBind" />
+        </div>
+
         <!-- 上传模式 (调试开关) -->
         <div class="setting-item">
           <text class="setting-label">上传模式</text>
@@ -82,6 +106,19 @@
           <text class="mqtt-status {{ mqttConnected ? 'mqtt-online' : 'mqtt-offline' }}">
             {{ mqttConnected ? '已连接' : '未连接' }}
           </text>
+        </div>
+
+        <!-- 服务器登录 / WebSocket 状态 -->
+        <div class="setting-item">
+          <text class="setting-label">服务器</text>
+          <text class="mqtt-status {{ cloudWsConnected ? 'mqtt-online' : 'mqtt-offline' }}">
+            {{ cloudStatusText }}
+          </text>
+        </div>
+
+        <div class="setting-item">
+          <text class="setting-label">实时通道</text>
+          <input type="button" class="cloud-btn" value="{{ cloudBusy ? '连接中…' : '重新连接' }}" onclick="reconnectCloud" />
         </div>
 
       </div>
@@ -268,6 +305,27 @@
   background-color: #FF9800;
 }
 
+.cloud-btn {
+  width: 110px;
+  height: 32px;
+  background-color: #2196F3;
+  border-radius: 16px;
+  font-size: 16px;
+  color: #FFFFFF;
+}
+
+.sn-input {
+  width: 180px;
+  height: 34px;
+  font-size: 14px;
+  color: #FFFFFF;
+  background-color: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 8px;
+  padding-left: 8px;
+  placeholder-color: #666666;
+}
+
 .save-btn {
   width: 100%;
   height: 40px;
@@ -311,6 +369,8 @@ import router from '@system.router'
 import storage from '@system.storage'
 import brightness from '@system.brightness'
 import prompt from '@system.prompt'
+import cloudService from '../../services/CloudService'
+import deviceBinding from '../../services/DeviceBindingService'
 
 export default {
   private: {
@@ -323,18 +383,191 @@ export default {
     mockMode: 'normal',
     // 上传模式
     uploadMode: 'http',
-    mqttConnected: false
+    mqttConnected: false,
+    // 云端连接
+    cloudLoggedIn: false,
+    cloudWsConnected: false,
+    cloudStatusText: '未登录',
+    cloudBusy: false,
+    cloudListener: null,
+    // 设备绑定
+    deviceSnInput: 'EH-WATCH-20260101',
+    bindingBound: false,
+    bindingStatusText: '默认'
   },
 
   onInit() {
     this.loadSettings()
     this.loadUploadMode()
     this.loadMqttStatus()
+    this.initCloudStatus()
+    this.initDeviceBinding()
   },
 
   onShow() {
     // 每次显示时刷新 MQTT 状态
     this.loadMqttStatus()
+    this.refreshCloudStatus()
+    this.refreshDeviceBinding()
+  },
+
+  onDestroy() {
+    if (this.cloudListener) {
+      cloudService.offStatusChange(this.cloudListener)
+      this.cloudListener = null
+    }
+    if (this.bindingListener) {
+      deviceBinding.offChange(this.bindingListener)
+      this.bindingListener = null
+    }
+  },
+
+  // ============================================
+  // 设备绑定（序列号 / 二维码）
+  // ============================================
+
+  initDeviceBinding() {
+    this.bindingListener = (status) => this.applyBindingStatus(status)
+    deviceBinding.onChange(this.bindingListener)
+    this.refreshDeviceBinding()
+  },
+
+  refreshDeviceBinding() {
+    this.applyBindingStatus(deviceBinding.getStatus())
+  },
+
+  applyBindingStatus(status) {
+    if (!status) return
+    this.deviceSnInput = status.deviceSn
+    this.bindingBound = !!status.bound
+
+    if (!status.bound) {
+      this.bindingStatusText = '默认'
+    } else {
+      const way = status.source === 'qrcode' ? '扫码' : '手动'
+      const time = status.boundAt ? this.formatBindTime(status.boundAt) : ''
+      this.bindingStatusText = way + '绑定' + (time ? ' ' + time : '')
+    }
+  },
+
+  formatBindTime(ts) {
+    const d = new Date(ts)
+    const mm = (d.getMonth() + 1).toString().padStart(2, '0')
+    const dd = d.getDate().toString().padStart(2, '0')
+    const hh = d.getHours().toString().padStart(2, '0')
+    const mi = d.getMinutes().toString().padStart(2, '0')
+    return `${mm}-${dd} ${hh}:${mi}`
+  },
+
+  onDeviceSnInput(evt) {
+    const value = evt && (evt.value !== undefined ? evt.value : evt.text)
+    if (value !== undefined && value !== null) {
+      this.deviceSnInput = String(value).toUpperCase()
+    }
+  },
+
+  saveDeviceBinding() {
+    const result = deviceBinding.bind(this.deviceSnInput, { source: 'manual' })
+    prompt.showToast({
+      message: result.ok ? `已绑定 ${deviceBinding.getDeviceSN()}` : result.message,
+      duration: 1800
+    })
+    if (!result.ok) return
+
+    this.refreshDeviceBinding()
+    this.notifyBindingChanged()
+  },
+
+  resetDeviceBinding() {
+    deviceBinding.reset()
+    prompt.showToast({ message: `已恢复默认 ${deviceBinding.getDeviceSN()}`, duration: 1800 })
+    this.refreshDeviceBinding()
+    this.notifyBindingChanged()
+  },
+
+  /**
+   * 扫码绑定入口
+   * 当前手表端无扫码能力：接入后把二维码内容传给 applyQrResult() 即可。
+   * 二维码内容约定：ehc://bind?sn=<device_sn>&elderly_id=<elderly_id>
+   */
+  scanBind() {
+    prompt.showToast({
+      message: '扫码绑定开发中，请先手动输入序列号',
+      duration: 2000
+    })
+  },
+
+  /**
+   * 处理二维码内容（手机端扫码 / 服务端下发绑定指令时调用）
+   */
+  applyQrResult(qrContent) {
+    const result = deviceBinding.bindByQRCode(qrContent)
+    prompt.showToast({
+      message: result.ok ? `扫码绑定成功 ${deviceBinding.getDeviceSN()}` : result.message,
+      duration: 1800
+    })
+    if (!result.ok) return
+
+    this.refreshDeviceBinding()
+    this.notifyBindingChanged()
+  },
+
+  /**
+   * 序列号变化后通知首页重连 MQTT（Topic 依赖 device_sn）
+   */
+  notifyBindingChanged() {
+    storage.set({
+      key: 'mqtt_cmd',
+      value: 'reconnect',
+      success: () => {},
+      fail: () => {}
+    })
+  },
+
+  /**
+   * 订阅云端（登录 + WebSocket）状态
+   */
+  initCloudStatus() {
+    cloudService.init()
+    this.cloudListener = (state) => this.applyCloudStatus(state)
+    cloudService.onStatusChange(this.cloudListener)
+    this.refreshCloudStatus()
+  },
+
+  refreshCloudStatus() {
+    this.applyCloudStatus(cloudService.getStatus())
+  },
+
+  applyCloudStatus(state) {
+    if (!state) return
+    this.cloudLoggedIn = !!state.loggedIn
+    this.cloudWsConnected = !!state.wsConnected
+    this.cloudBusy = state.wsStatus === 'connecting' || state.wsStatus === 'reconnecting'
+
+    if (!state.loggedIn) {
+      this.cloudStatusText = state.lastError ? '连接失败' : '未登录'
+    } else if (state.wsConnected) {
+      this.cloudStatusText = '在线'
+    } else {
+      this.cloudStatusText = '重连中'
+    }
+  },
+
+  /**
+   * 手动重新登录并建立 WebSocket
+   */
+  reconnectCloud() {
+    if (this.cloudBusy) return
+    this.cloudBusy = true
+
+    cloudService.ensureOnline((err) => {
+      this.cloudBusy = false
+      this.refreshCloudStatus()
+      prompt.showToast({
+        message: err ? ('连接失败：' + (err.message || '请检查网络')) : '已连接服务器',
+        duration: 1800
+      })
+    })
   },
 
   loadSettings() {

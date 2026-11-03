@@ -1,12 +1,19 @@
 <template>
   <div class="container">
-    <!-- 顶部标题：菜单 -->
+    <!-- 顶部标题：菜单 + 云端连接状态 -->
     <div class="top-bar">
       <text class="menu-title">菜单</text>
+      <div class="cloud-bar">
+        <div class="cloud-dot {{ cloudWsConnected ? 'cloud-dot-online' : 'cloud-dot-offline' }}"></div>
+        <text class="cloud-text">{{ cloudStatusText }}</text>
+      </div>
     </div>
 
     <!-- 日期 -->
     <text class="date-text">{{ currentDate }}</text>
+
+    <!-- 今日签到状态（点击进入签到页） -->
+    <text class="signin-text {{ signinDone ? 'signin-done' : 'signin-todo' }}" onclick="openCheckIn">{{ signinText }}</text>
 
     <!-- 功能菜单 2x2 网格 -->
     <div class="menu-grid">
@@ -90,6 +97,52 @@
   font-size: 26px;
   color: #7dd3fc;
   margin-bottom: 18px;
+}
+
+.signin-text {
+  font-size: 18px;
+  margin-bottom: 10px;
+}
+
+.signin-done {
+  color: #22c55e;
+}
+
+.signin-todo {
+  color: #f59e0b;
+}
+
+.cloud-bar {
+  flex-direction: row;
+  align-items: center;
+  margin-left: 10px;
+  padding-left: 10px;
+  padding-right: 10px;
+  padding-top: 3px;
+  padding-bottom: 3px;
+  border-radius: 12px;
+  background-color: rgba(255, 255, 255, 0.06);
+}
+
+.cloud-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 4px;
+  margin-right: 6px;
+  background-color: #f59e0b;
+}
+
+.cloud-dot-online {
+  background-color: #22c55e;
+}
+
+.cloud-dot-offline {
+  background-color: #f59e0b;
+}
+
+.cloud-text {
+  font-size: 12px;
+  color: #94a3b8;
 }
 
 .menu-grid {
@@ -195,13 +248,16 @@
 import router from '@system.router'
 import storage from '@system.storage'
 import vibrator from '@system.vibrator'
-import { VITAL_RANGES, STORAGE_KEYS, UPLOAD_MODE } from '../../utils/constants'
+import { VITAL_RANGES, STORAGE_KEYS, UPLOAD_MODE, VITAL_UPLOAD_INTERVAL } from '../../utils/constants'
 import { HealthRulesEngine, FallDetector } from '../../utils/health-rules'
 import SensorService from '../../services/SensorService'
 import DataCache from '../../services/DataCache'
 import UploadService from '../../services/UploadService'
 import AlarmService from '../../services/AlarmService'
 import MqttService from '../../services/MqttService'
+import cloudService from '../../services/CloudService'
+import deviceBinding from '../../services/DeviceBindingService'
+import signinService from '../../services/SigninService'
 
 export default {
   private: {
@@ -238,9 +294,21 @@ export default {
     uploadMode: 'http',       // 当前上传模式
     mqttConnected: false,     // MQTT 连接状态
 
+    // 云端连接状态（服务器登录 + WebSocket 实时通道）
+    cloudLoggedIn: false,
+    cloudWsConnected: false,
+    cloudStatusText: '正在登录服务器…',
+    cloudListener: null,
+
+    // 今日签到状态
+    signinDone: false,
+    signinText: '今日未签到',
+    autoSigninBusy: false,
+
     // 定时器
     dataTimer: null,
     uploadTimer: null,
+    uploadBusy: false,
     timeTimer: null,
 
     // 服务实例
@@ -286,8 +354,18 @@ export default {
   onShow() {
     // 重新加载设置，确保数据来源配置是最新的
     this.loadSettings()
-    // 早晨未签到时自动跳转到每日签到页
-    this.checkMorningCheckIn()
+    // 自动签到：开机/回到首页立即本地签到，服务器可用后自动同步
+    this.autoCheckIn()
+    // 每次回到首页检查云端连接（登录 + WebSocket）
+    this.ensureCloudOnline()
+    // 刷新今日签到状态（从签到页返回时能看到变化）
+    this.refreshSigninStatus()
+    // 补传未同步到服务器的签到记录
+    this._flushPendingSignin()
+    // 早晨未签到时自动跳转到每日签到页（延迟判断，避免与自动签到竞态）
+    setTimeout(() => {
+      this.checkMorningCheckIn()
+    }, 1500)
     // 重新加载上传模式（用户可能在设置页修改了）
     this._loadUploadModeConfig()
     // 立刻同步当前上传模式（避免异步竞态）
@@ -340,6 +418,11 @@ export default {
   onDestroy() {
     this.stopDataCollection()
     this.stopTimers()
+    // 仅解绑页面监听，保留全局云端连接（SOS 页仍需下发报警）
+    if (this.cloudListener) {
+      cloudService.offStatusChange(this.cloudListener)
+      this.cloudListener = null
+    }
     this.cleanupServices()
   },
 
@@ -383,6 +466,8 @@ export default {
         // 连接成功后上报一次在线数据
         if (connected) {
           this._publishOnline()
+          // 补传离线期间的签到记录
+          this._flushPendingSignin()
         }
       },
       onError: (error) => {
@@ -410,6 +495,51 @@ export default {
       this.dataSource = this.sensorService.getDataSource()
       console.log(`数据来源: ${this.dataSource === 'mock' ? '模拟数据' : '真实传感器'}`)
     })
+
+    // 云端连接：登录服务器 + 建立 WebSocket
+    this.initCloudConnection()
+  },
+
+  /**
+   * 初始化云端连接（第一步：登录服务器并建立 WebSocket 长连接）
+   */
+  initCloudConnection() {
+    cloudService.init({
+      onAlarmMessage: (alarm) => {
+        console.log(`[Index] 收到服务器报警推送: ${alarm && alarm.alarm_type}`)
+      }
+    })
+
+    this.cloudListener = (state) => {
+      this.cloudLoggedIn = state.loggedIn
+      this.cloudWsConnected = state.wsConnected
+
+      if (!state.loggedIn) {
+        this.cloudStatusText = state.lastError ? '服务器未连接' : '登录服务器中…'
+      } else if (state.wsConnected) {
+        this.cloudStatusText = '云端在线 · ' + state.username
+      } else {
+        this.cloudStatusText = '已登录 · 实时通道重连中'
+      }
+
+      // 与服务器连接成功 → 自动签到（幂等，今日已同步则跳过）
+      if (state.loggedIn) {
+        this.autoCheckIn()
+      }
+    }
+
+    cloudService.onStatusChange(this.cloudListener)
+    this.cloudListener(cloudService.getStatus())
+    cloudService.start()
+  },
+
+  /**
+   * 确保云端在线（网络恢复 / 页面回来时调用）
+   */
+  ensureCloudOnline() {
+    if (!cloudService.isOnline()) {
+      cloudService.ensureOnline()
+    }
   },
 
   /**
@@ -441,16 +571,24 @@ export default {
     storage.get({
       key: 'mqtt_cmd',
       success: (data) => {
-        if (data === 'connect') {
-          console.log('[Index] 收到 MQTT 连接命令')
+        if (data === 'connect' || data === 'reconnect') {
+          const isReconnect = data === 'reconnect'
+          console.log('[Index] 收到 MQTT ' + (isReconnect ? '重连' : '连接') + '命令')
           // 清除命令
           storage.delete({
             key: 'mqtt_cmd',
             success: () => {},
             fail: () => {}
           })
-          // 执行连接
-          if (this.mqttService && !this.mqttService.isConnected()) {
+          if (!this.mqttService) return
+
+          if (isReconnect) {
+            // 序列号变化后 Topic 改变，需要断开重连
+            this.mqttService.disconnect()
+            setTimeout(() => {
+              if (this.mqttService) this.mqttService.connect()
+            }, 500)
+          } else if (!this.mqttService.isConnected()) {
             this.mqttService.connect()
           }
         }
@@ -466,16 +604,19 @@ export default {
     if (!this.mqttService) return
 
     const { API_CONFIG } = require('../../utils/constants')
-    const { DEVICE_SN, ELDERLY_ID, MQTT_TOPICS } = API_CONFIG
+    const { MQTT_TOPICS } = API_CONFIG
+
+    // 使用当前绑定的序列号（设置页可修改）
+    const deviceSn = deviceBinding.getDeviceSN()
 
     const packet = {
-      device_sn: DEVICE_SN,
-      elderly_id: ELDERLY_ID,
+      device_sn: deviceSn,
+      elderly_id: deviceBinding.getElderlyId(),
       firmware_version: '1.0.0'
     }
 
-    this.mqttService.publish(MQTT_TOPICS.ONLINE(DEVICE_SN), packet)
-    console.log(`[Index] 设备上线已上报 → device/${DEVICE_SN}/online`)
+    this.mqttService.publish(MQTT_TOPICS.ONLINE(deviceSn), packet)
+    console.log(`[Index] 设备上线已上报 → device/${deviceSn}/online`)
   },
 
   /**
@@ -494,6 +635,328 @@ export default {
             uri: '/pages/checkin'
           })
         }
+      },
+      fail: () => {}
+    })
+  },
+
+  /**
+   * 自动签到：开机连上服务器后，若今日未签到则自动完成
+   *   - 今日已签到且已同步 → 跳过
+   *   - 今日已签到但未同步 → 重试上报
+   *   - 今日未签到 → 生成记录、本地保存并上报
+   */
+  autoCheckIn() {
+    if (this.autoSigninBusy) return
+    this.autoSigninBusy = true
+
+    const today = new Date().toDateString()
+
+    storage.get({
+      key: STORAGE_KEYS.SIGNIN_RECORD,
+      success: (data) => {
+        let record = null
+        if (data) {
+          try {
+            record = JSON.parse(data)
+          } catch (e) {
+            record = null
+          }
+        }
+
+        if (record && record.date === today) {
+          if (record.synced) {
+            console.log('[AutoSignin] 今日已签到并已同步，跳过')
+            this.autoSigninBusy = false
+            return
+          }
+          // 失败后 60s 内不重复上报，避免连接抖动时频繁请求
+          if (record.lastTry && Date.now() - record.lastTry < 60000) {
+            this.autoSigninBusy = false
+            return
+          }
+          console.log('[AutoSignin] 今日已签到但未同步，重试上报')
+          this._reportSignin(record)
+          return
+        }
+
+        this._doAutoCheckIn()
+      },
+      fail: () => this._doAutoCheckIn()
+    })
+  },
+
+  /**
+   * 执行自动签到（生成记录 + 本地持久化 + 上报）
+   */
+  _doAutoCheckIn() {
+    const now = new Date()
+    const hh = now.getHours().toString().padStart(2, '0')
+    const mi = now.getMinutes().toString().padStart(2, '0')
+
+    const record = {
+      date: now.toDateString(),
+      time: `${hh}:${mi}`,
+      timestamp: now.getTime(),
+      method: 'auto',
+      synced: false
+    }
+
+    console.log(`[AutoSignin] 自动签到成功（本地） ${record.time}`)
+
+    storage.set({
+      key: STORAGE_KEYS.SIGNIN_RECORD,
+      value: JSON.stringify(record),
+      success: () => {},
+      fail: (data, code) => console.error(`[AutoSignin] 保存签到记录失败: code=${code}`)
+    })
+    // 兼容旧键（早晨自动跳转逻辑依赖）
+    storage.set({
+      key: STORAGE_KEYS.CHECKIN_DATE,
+      value: record.date,
+      success: () => {},
+      fail: () => {}
+    })
+
+    // 立即刷新界面
+    this.signinDone = true
+    this.signinText = `今日已签到 ${record.time}`
+
+    this._reportSignin(record)
+  },
+
+  /**
+   * 上报签到记录：MQTT 优先，HTTP 兜底，失败进入待同步队列
+   */
+  _reportSignin(record) {
+    let finished = false
+    const done = () => {
+      if (finished) return
+      finished = true
+      this.autoSigninBusy = false
+    }
+
+    // 1) MQTT 模式且长连接已建立
+    if (this.uploadMode === UPLOAD_MODE.MQTT && this.mqttService && this.mqttService.isConnected()) {
+      const { API_CONFIG } = require('../../utils/constants')
+      const deviceSn = deviceBinding.getDeviceSN()
+
+      this.mqttService.publish(API_CONFIG.MQTT_TOPICS.SIGNIN(deviceSn), {
+        device_sn: deviceSn,
+        elderly_id: deviceBinding.getElderlyId(),
+        method: record.method || 'auto',
+        timestamp: record.timestamp || Date.now()
+      })
+      console.log('[AutoSignin] 签到已通过 MQTT 上报')
+      this._markSigninSynced(record)
+      done()
+      return
+    }
+
+    // 2) HTTP 代签到接口
+    signinService.report(record, (err) => {
+      if (err) {
+        console.warn('[AutoSignin] 签到上报失败: ' + (err.message || err))
+        this._enqueueSignin(record)
+        this._markSigninRetry(record)
+      } else {
+        console.log('[AutoSignin] 签到已同步到服务器')
+        this._markSigninSynced(record)
+      }
+      done()
+    })
+
+    // 3) 超时兜底，避免阻塞后续状态变化时的重试
+    setTimeout(done, 15000)
+  },
+
+  /**
+   * 标记本地签到记录为已同步
+   */
+  _markSigninSynced(record) {
+    const synced = Object.assign({}, record, { synced: true })
+    storage.set({
+      key: STORAGE_KEYS.SIGNIN_RECORD,
+      value: JSON.stringify(synced),
+      success: () => {},
+      fail: () => {}
+    })
+    this.signinDone = true
+    this.signinText = record.time ? `今日已签到 ${record.time}` : '今日已签到'
+  },
+
+  /**
+   * 记录一次上报尝试时间（用于失败冷却）
+   */
+  _markSigninRetry(record) {
+    const retried = Object.assign({}, record, { synced: false, lastTry: Date.now() })
+    storage.set({
+      key: STORAGE_KEYS.SIGNIN_RECORD,
+      value: JSON.stringify(retried),
+      success: () => {},
+      fail: () => {}
+    })
+  },
+
+  /**
+   * 签到记录进入待同步队列（下次联网或 MQTT 连接后补传）
+   */
+  _enqueueSignin(record) {
+    storage.get({
+      key: STORAGE_KEYS.SIGNIN_PENDING,
+      success: (data) => {
+        let list = []
+        if (data) {
+          try {
+            list = JSON.parse(data)
+          } catch (e) {
+            list = []
+          }
+        }
+        if (!Array.isArray(list)) list = []
+        list.push(record)
+        if (list.length > 50) list = list.slice(-50)
+
+        storage.set({
+          key: STORAGE_KEYS.SIGNIN_PENDING,
+          value: JSON.stringify(list),
+          success: () => {},
+          fail: () => {}
+        })
+      },
+      fail: () => {
+        storage.set({
+          key: STORAGE_KEYS.SIGNIN_PENDING,
+          value: JSON.stringify([record]),
+          success: () => {},
+          fail: () => {}
+        })
+      }
+    })
+  },
+
+  /**
+   * 刷新今日签到状态（今日已签到 HH:mm / 今日未签到）
+   */
+  refreshSigninStatus() {
+    const today = new Date().toDateString()
+
+    storage.get({
+      key: STORAGE_KEYS.SIGNIN_RECORD,
+      success: (data) => {
+        if (data) {
+          try {
+            const record = JSON.parse(data)
+            if (record && record.date === today) {
+              this.signinDone = true
+              this.signinText = record.time ? `今日已签到 ${record.time}` : '今日已签到'
+              return
+            }
+          } catch (e) {
+            console.warn('[Index] 签到记录解析失败')
+          }
+        }
+
+        // 兼容旧版本只存了 checkin_date
+        storage.get({
+          key: STORAGE_KEYS.CHECKIN_DATE,
+          success: (value) => {
+            this.signinDone = value === today
+            this.signinText = this.signinDone ? '今日已签到' : '今日未签到'
+          },
+          fail: () => {
+            this.signinDone = false
+            this.signinText = '今日未签到'
+          }
+        })
+      },
+      fail: () => {
+        this.signinDone = false
+        this.signinText = '今日未签到'
+      }
+    })
+  },
+
+  /**
+   * 进入每日签到页
+   */
+  openCheckIn() {
+    router.push({
+      uri: '/pages/checkin'
+    })
+  },
+
+  /**
+   * 补传待同步的签到记录
+   *   服务端签到记录由 MQTT topic device/{sn}/signin 写入，
+   *   因此仅在 MQTT 模式且连接成功后补传。
+   */
+  _flushPendingSignin() {
+    storage.get({
+      key: STORAGE_KEYS.SIGNIN_PENDING,
+      success: (data) => {
+        let list = []
+        if (data) {
+          try {
+            list = JSON.parse(data)
+          } catch (e) {
+            list = []
+          }
+        }
+        if (!Array.isArray(list) || list.length === 0) return
+
+        // MQTT 模式且已连接：走 topic device/{sn}/signin
+        if (this.uploadMode === UPLOAD_MODE.MQTT && this.mqttService && this.mqttService.isConnected()) {
+          const { API_CONFIG } = require('../../utils/constants')
+          const deviceSn = deviceBinding.getDeviceSN()
+
+          list.forEach((record) => {
+            this.mqttService.publish(API_CONFIG.MQTT_TOPICS.SIGNIN(deviceSn), {
+              device_sn: deviceSn,
+              elderly_id: deviceBinding.getElderlyId(),
+              method: (record && record.method) || 'manual',
+              timestamp: (record && record.timestamp) || Date.now()
+            })
+          })
+
+          console.log(`[Index] 已补传 ${list.length} 条签到记录（MQTT）`)
+          storage.delete({
+            key: STORAGE_KEYS.SIGNIN_PENDING,
+            success: () => {},
+            fail: () => {}
+          })
+          return
+        }
+
+        // HTTP 兜底：用代签到接口补传最近一条
+        const latest = list[list.length - 1]
+        signinService.report(latest, (err) => {
+          if (err) {
+            console.warn('[Index] 签到补传失败: ' + (err.message || err))
+            return
+          }
+          console.log('[Index] 签到记录已补传到服务器（HTTP）')
+          storage.delete({
+            key: STORAGE_KEYS.SIGNIN_PENDING,
+            success: () => {}
+          })
+          // 若补传的是今日记录，标记为已同步，避免重复上报
+          storage.get({
+            key: STORAGE_KEYS.SIGNIN_RECORD,
+            success: (data) => {
+              if (!data) return
+              try {
+                const record = JSON.parse(data)
+                if (record && latest && record.date === latest.date) {
+                  this._markSigninSynced(record)
+                  return
+                }
+              } catch (e) {}
+              this.refreshSigninStatus()
+            },
+            fail: () => this.refreshSigninStatus()
+          })
+        })
       },
       fail: () => {}
     })
@@ -593,15 +1056,23 @@ export default {
    * 启动定时器
    */
   startTimers() {
+    // 防止重复创建定时器
+    this.stopTimers()
+
     // 每秒更新时间
     this.timeTimer = setInterval(() => {
       this.updateTime()
     }, 1000)
 
-    // 每30秒上传数据
+    // 每 5 秒上报一次体征数据
     this.uploadTimer = setInterval(() => {
       this.uploadData()
-    }, 30000)
+    }, VITAL_UPLOAD_INTERVAL)
+
+    console.log(`[Index] 体征上报间隔: ${VITAL_UPLOAD_INTERVAL / 1000}s`)
+
+    // 进入首页立即上报一次，之后按间隔持续上报
+    this.uploadData()
   },
 
   /**
@@ -818,6 +1289,12 @@ export default {
   uploadData() {
     if (!this.uploadService) return
 
+    // 5秒一次：上一次请求未返回时跳过本轮，避免请求堆叠
+    if (this.uploadBusy) {
+      console.log('[Index] 上一次体征上报未完成，跳过本轮')
+      return
+    }
+
     // 同步电量到 MqttService（心跳上报用）
     if (this.mqttService && this.batteryLevel >= 0) {
       this.mqttService.setBatteryLevel(this.batteryLevel)
@@ -835,12 +1312,26 @@ export default {
     // 仅在有有效数据时上传
     if (vitalData.heartRate > 0 || vitalData.spo2 > 0) {
       const modeTag = this.uploadMode === UPLOAD_MODE.MQTT ? '[MQTT]' : '[HTTP]'
+
+      this.uploadBusy = true
+      let released = false
+      const release = () => {
+        released = true
+        this.uploadBusy = false
+      }
+      // 超时兜底：即使回调未触发也能继续下一轮
+      setTimeout(() => {
+        if (!released) release()
+      }, VITAL_UPLOAD_INTERVAL)
+
       this.uploadService.uploadVitalSigns(
         vitalData,
         () => {
-          console.log(`${modeTag} 体征数据上报成功`)
+          release()
+          console.log(`${modeTag} 体征数据上报成功 HR=${vitalData.heartRate} SpO2=${vitalData.spo2}`)
         },
         (error) => {
+          release()
           console.error(`${modeTag} 体征数据上报失败:`, error)
         }
       )

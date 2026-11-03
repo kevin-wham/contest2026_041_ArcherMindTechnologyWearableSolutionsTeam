@@ -4,16 +4,20 @@
     <text class="sos-title">紧急求助</text>
 
     <!-- SOS 大按钮：长按触发 -->
-    <div class="sos-button"
+    <div class="sos-button {{ sendState === 'ok' ? 'sos-button-ok' : '' }}"
          ontouchstart="onSOSPress"
          ontouchend="onSOSRelease">
-      <text class="sos-label" if="{{ !isTriggered }}">SOS</text>
-      <text class="sos-label" if="{{ isTriggered }}">发送中…</text>
+      <text class="sos-label" if="{{ sendState === 'idle' }}">SOS</text>
+      <text class="sos-label" if="{{ sendState === 'sending' }}">发送中…</text>
+      <text class="sos-label sos-result-label" if="{{ sendState === 'ok' }}">已报警</text>
+      <text class="sos-label sos-result-label" if="{{ sendState === 'fail' }}">发送失败</text>
     </div>
 
     <!-- 底部提示 -->
-    <text class="sos-hint" if="{{ !isTriggered }}">长按触发</text>
-    <text class="sos-hint" if="{{ isTriggered }}">正在联系家人</text>
+    <text class="sos-hint" if="{{ sendState === 'idle' }}">长按触发</text>
+    <text class="sos-hint" if="{{ sendState === 'sending' }}">正在联系家人</text>
+    <text class="sos-hint" if="{{ sendState === 'ok' }}">已通知家人与工作人员</text>
+    <text class="sos-hint" if="{{ sendState === 'fail' }}">已保存本地，网络恢复后自动重发</text>
   </div>
 </template>
 
@@ -56,6 +60,15 @@
   font-weight: 700;
 }
 
+.sos-result-label {
+  font-size: 40px;
+}
+
+.sos-button-ok {
+  background: linear-gradient(180deg, #22c55e 0%, #15803d 100%);
+  border-color: #86efac;
+}
+
 .sos-hint {
   font-size: 22px;
   color: #fca5a5;
@@ -68,9 +81,10 @@ import router from '@system.router'
 import vibrator from '@system.vibrator'
 import geolocation from '@system.geolocation'
 import storage from '@system.storage'
-import { STORAGE_KEYS } from '../../utils/constants'
+import { STORAGE_KEYS, ALARM_LEVELS } from '../../utils/constants'
 import UploadService from '../../services/UploadService'
 import AlarmService from '../../services/AlarmService'
+import cloudService from '../../services/CloudService'
 
 export default {
   protected: {
@@ -79,6 +93,8 @@ export default {
 
   private: {
     isTriggered: false,
+    // 发送状态：idle(待触发) / sending(发送中) / ok(已报警) / fail(发送失败)
+    sendState: 'idle',
     heartRate: '--',
     spo2: '--',
     temperature: '--',
@@ -109,6 +125,9 @@ export default {
 
     this.alarmService = new AlarmService(this.uploadService)
     this.alarmService.init({})
+
+    // 确保已登录服务器并建立 WebSocket（报警指令优先走实时通道）
+    cloudService.start()
   },
 
   /**
@@ -118,10 +137,18 @@ export default {
     if (this.sosData) {
       try {
         this.sosPacket = JSON.parse(this.sosData)
-        this.heartRate = this.sosPacket.heartRate || '--'
-        this.spo2 = this.sosPacket.spo2 || '--'
-        this.temperature = this.sosPacket.temperature || '--'
-        this.hasLocation = !!this.sosPacket.location
+        // 兼容 AlarmService 上报包（heart_rate）与本页默认包（heartRate）
+        const hr = this.sosPacket.heartRate || this.sosPacket.heart_rate
+        const ox = this.sosPacket.spo2
+        const temp = this.sosPacket.temperature
+        this.heartRate = hr > 0 ? hr : '--'
+        this.spo2 = ox > 0 ? ox : '--'
+        this.temperature = temp > 0 ? temp : '--'
+        this.hasLocation = !!(this.sosPacket.location || this.sosPacket.latitude)
+
+        // 带报警数据进入页面（SOS 长按/跌倒检测/规则报警）：
+        // 由本页面统一上报并显示"已报警/发送失败"结果
+        this.uploadAlarmData(this.sosPacket)
       } catch (e) {
         console.error('解析 SOS 数据失败:', e)
         this.initDefaultData()
@@ -207,10 +234,12 @@ export default {
    * 触发 SOS 报警
    */
   triggerSOS() {
-    if (this.isTriggered) return
+    // 发送中时忽略重复触发，完成后可再次长按补发
+    if (this.sendState === 'sending') return
 
     this.stopLongPress()
     this.isTriggered = true
+    this.sendState = 'sending'
 
     vibrator.vibrate({
       mode: 'long',
@@ -220,18 +249,50 @@ export default {
       }
     })
 
-    this.saveAlarmRecord()
-    this.uploadAlarmData()
+    // 构建符合服务器协议的报警包（alarm_type=SOS, severity=P0）
+    const alarmPacket = this.buildAlarmPacket()
+    this.sosPacket = alarmPacket
 
-    setTimeout(() => {
-      this.returnToHome()
-    }, 3000)
+    this.saveAlarmRecord(alarmPacket)
+    this.uploadAlarmData(alarmPacket)
+  },
+
+  /**
+   * 构建报警数据包
+   * 字段匹配：POST /v1/alarms/report
+   */
+  buildAlarmPacket() {
+    const vitals = {
+      heartRate: this.heartRate !== '--' ? this.heartRate : 0,
+      spo2: this.spo2 !== '--' ? this.spo2 : 0,
+      temperature: this.temperature !== '--' ? this.temperature : 0
+    }
+    // 位置：兼容本页包（location 对象）与 AlarmService 包（latitude/longitude）
+    let location = null
+    if (this.sosPacket) {
+      if (this.sosPacket.location) {
+        location = this.sosPacket.location
+      } else if (this.sosPacket.latitude) {
+        location = { latitude: this.sosPacket.latitude, longitude: this.sosPacket.longitude }
+      }
+    }
+
+    const packet = this.uploadService.buildAlarmPacket(
+      'sos',
+      ALARM_LEVELS.P0,
+      vitals,
+      location,
+      { trigger: 'MANUAL_LONG_PRESS' }
+    )
+    packet.description = '用户长按 SOS 按键触发紧急求助'
+    return packet
   },
 
   /**
    * 保存报警记录
    */
-  saveAlarmRecord() {
+  saveAlarmRecord(packet) {
+    const record = packet || this.sosPacket
     storage.get({
       key: STORAGE_KEYS.SOS_RECORDS,
       success: (data) => {
@@ -244,7 +305,7 @@ export default {
           }
         }
 
-        records.push(this.sosPacket)
+        records.push(record)
 
         if (records.length > 100) {
           records = records.slice(-100)
@@ -263,7 +324,7 @@ export default {
         console.error('读取报警记录失败')
         storage.set({
           key: STORAGE_KEYS.SOS_RECORDS,
-          value: JSON.stringify([this.sosPacket]),
+          value: JSON.stringify([record]),
           success: () => {},
           fail: () => {
             console.error('保存报警记录失败')
@@ -275,9 +336,44 @@ export default {
 
   /**
    * 上传报警数据
+   *   - WebSocket 在线：立即下发报警指令
+   *   - HTTP：写入 alarm_records（保证报警不丢）
+   * 上传结果驱动界面：成功显示"已报警"，失败显示"发送失败"（本地已保存）
    */
-  uploadAlarmData() {
-    this.uploadService.uploadAlarm(this.sosPacket)
+  uploadAlarmData(packet) {
+    const alarmPacket = packet || this.sosPacket
+    let returned = false
+
+    this.isTriggered = true
+    this.sendState = 'sending'
+
+    const finish = (ok) => {
+      // 结果可多次更新（超时先到、成功后到），但只安排一次返回
+      this.sendState = ok ? 'ok' : 'fail'
+      if (returned) return
+      returned = true
+      // 展示结果片刻后返回首页
+      setTimeout(() => {
+        this.returnToHome()
+      }, 2500)
+    }
+
+    this.uploadService.uploadAlarm(
+      alarmPacket,
+      () => {
+        console.log('[SOS] 报警已送达服务器')
+        finish(true)
+      },
+      (err) => {
+        console.warn('[SOS] 报警发送失败: ' + (err || 'unknown'))
+        finish(false)
+      }
+    )
+
+    // 超时兜底：避免网络极慢时页面一直停在"发送中"
+    setTimeout(() => {
+      if (this.sendState === 'sending') finish(false)
+    }, 8000)
   },
 
   /**

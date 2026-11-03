@@ -13,6 +13,7 @@
 
 import { API_CONFIG } from '../utils/constants'
 import fetch from '@system.fetch'
+import deviceBinding from './DeviceBindingService'
 
 // 传输层类型
 const TRANSPORT_NONE = 0
@@ -97,13 +98,13 @@ export class MqttService {
 
     // 发送上线消息（字段匹配服务端 HandleHTTPDeviceOnline）
     const packet = {
-      device_sn: API_CONFIG.DEVICE_SN,
-      elderly_id: API_CONFIG.ELDERLY_ID,
+      device_sn: deviceBinding.getDeviceSN(),
+      elderly_id: deviceBinding.getElderlyId(),
       firmware_version: '1.0.0'
     }
 
     this._sendHttpRequest(
-      `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.DEVICE_ONLINE}`,
+      `${API_CONFIG.SERVICES.DEVICE}${API_CONFIG.ENDPOINTS.V1.DEVICE_ONLINE}`,
       packet,
       () => {
         // 成功：标记为已连接
@@ -147,8 +148,11 @@ export class MqttService {
     const retain = options.retain || false
 
     if (!this.connected) {
-      console.log(`[MQTT] 未连接，缓存: ${topic}`)
-      this.pendingPublishes.push({ topic, payload, options })
+      // options.cache === false 时不入缓存（调用方会立即回退 HTTP，避免重复发送）
+      if (options.cache !== false) {
+        console.log(`[MQTT] 未连接，缓存: ${topic}`)
+        this.pendingPublishes.push({ topic, payload, options })
+      }
       if (!this.connecting && this.reconnectEnabled) this.connect()
       return false
     }
@@ -156,23 +160,24 @@ export class MqttService {
     // HTTP 模式：直接 POST 到服务器
     console.log(`[MQTT] 发布: ${topic}`)
 
-    // 根据 topic 选择正确的 API 端点
-    let url = API_CONFIG.BASE_URL
+    // 根据 topic 选择正确的 API 端点（微服务直连）
+    let url = ''
     if (topic.includes('/vital')) {
-      url += API_CONFIG.ENDPOINTS.VITAL_SIGN
+      url = API_CONFIG.SERVICES.VITAL + API_CONFIG.ENDPOINTS.V1.VITAL_SIGN
     } else if (topic.includes('/alarm')) {
-      url += API_CONFIG.ENDPOINTS.ALARM_REPORT
+      url = API_CONFIG.SERVICES.ALARM + API_CONFIG.ENDPOINTS.V1.ALARM_REPORT
     } else if (topic.includes('/heartbeat')) {
-      url += API_CONFIG.ENDPOINTS.DEVICE_HEARTBEAT
+      url = API_CONFIG.SERVICES.DEVICE + API_CONFIG.ENDPOINTS.V1.DEVICE_HEARTBEAT
     } else if (topic.includes('/position')) {
-      url += API_CONFIG.ENDPOINTS.DEVICE_POSITION
+      url = API_CONFIG.SERVICES.DEVICE + API_CONFIG.ENDPOINTS.V1.DEVICE_POSITION
     } else if (topic.includes('/online')) {
-      url += API_CONFIG.ENDPOINTS.DEVICE_ONLINE
+      url = API_CONFIG.SERVICES.DEVICE + API_CONFIG.ENDPOINTS.V1.DEVICE_ONLINE
     } else {
-      url += `/api/v1/${topic}`
+      url = API_CONFIG.BASE_URL + `/api/v1/${topic}`
     }
 
-    this._sendHttpRequest(url, payload, () => {}, () => {})
+    // options.onSuccess / options.onError：发布结果回调（调用方可据此回退 HTTP）
+    this._sendHttpRequest(url, payload, options.onSuccess, options.onError)
     return true
   }
 
@@ -289,9 +294,9 @@ export class MqttService {
 
   _sendPing() {
     // 心跳：字段匹配服务端 HandleHTTPHeartbeat
-    const url = `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.DEVICE_HEARTBEAT}`
+    const url = `${API_CONFIG.SERVICES.DEVICE}${API_CONFIG.ENDPOINTS.V1.DEVICE_HEARTBEAT}`
     this._sendHttpRequest(url, {
-      device_sn: API_CONFIG.DEVICE_SN,
+      device_sn: deviceBinding.getDeviceSN(),
       battery: this._batteryLevel || 100,
       signal_strength: 72,
       firmware_version: '1.0.0'

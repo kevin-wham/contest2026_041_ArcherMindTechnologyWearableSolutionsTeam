@@ -50,10 +50,7 @@ export class AlarmService {
       // 保存报警记录到本地
       this.saveAlarmRecord(alarmPacket)
 
-      // 上传报警数据到服务器
-      this.uploadService.uploadAlarm(alarmPacket)
-
-      // 跳转到 SOS 页面
+      // 跳转到 SOS 页面（由页面统一上报并显示"已报警/发送失败"结果）
       router.push({
         uri: '/pages/sos',
         params: {
@@ -95,10 +92,7 @@ export class AlarmService {
       // 保存报警记录到本地
       this.saveAlarmRecord(alarmPacket)
 
-      // 上传报警数据到服务器
-      this.uploadService.uploadAlarm(alarmPacket)
-
-      // 跳转到 SOS 页面
+      // 跳转到 SOS 页面（由页面统一上报并显示结果）
       router.push({
         uri: '/pages/sos',
         params: {

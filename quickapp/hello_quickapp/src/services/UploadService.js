@@ -14,10 +14,14 @@ import network from '@system.network'
 import battery from '@system.battery'
 import storage from '@system.storage'
 import { API_CONFIG, STORAGE_KEYS, UPLOAD_MODE } from '../utils/constants'
+import cloudService from './CloudService'
+import deviceBinding from './DeviceBindingService'
 
 export class UploadService {
   constructor() {
-    this.isNetworkAvailable = false
+    // 乐观默认：network.getType 可能失败/未声明权限，
+    // 若默认 false 会导致报警被静默缓存而永远发不出去
+    this.isNetworkAvailable = true
     this.pendingAlarms = []
     this.pendingVitals = []
     this.retryCount = {}
@@ -30,6 +34,55 @@ export class UploadService {
     // === 新增：上传模式与 MQTT ===
     this.uploadMode = UPLOAD_MODE.HTTP  // 默认 HTTP 模式
     this.mqttService = null              // MQTT 服务实例
+
+    // === 云端连接（登录 + WebSocket 实时通道）===
+    this.cloudService = cloudService
+    this.authService = null
+  }
+
+  /**
+   * 绑定认证服务（用于给 HTTP 请求附加 Bearer Token）
+   */
+  setAuthService(authService) {
+    this.authService = authService
+  }
+
+  /**
+   * 统一请求头：需要鉴权时附加 Authorization
+   */
+  _jsonHeader() {
+    const header = { 'Content-Type': 'application/json' }
+    if (this.authService) {
+      const auth = this.authService.getAuthHeader()
+      if (auth.Authorization) header.Authorization = auth.Authorization
+    } else if (this.cloudService) {
+      const auth = this.cloudService.getAuthHeader()
+      if (auth.Authorization) header.Authorization = auth.Authorization
+    }
+    return header
+  }
+
+  // ============================================
+  // 接口地址（微服务直连）
+  // ============================================
+  _vitalUrl() {
+    return API_CONFIG.SERVICES.VITAL + API_CONFIG.ENDPOINTS.V1.VITAL_SIGN
+  }
+
+  _alarmUrl() {
+    return API_CONFIG.SERVICES.ALARM + API_CONFIG.ENDPOINTS.V1.ALARM_REPORT
+  }
+
+  _heartbeatUrl() {
+    return API_CONFIG.SERVICES.DEVICE + API_CONFIG.ENDPOINTS.V1.DEVICE_HEARTBEAT
+  }
+
+  _onlineUrl() {
+    return API_CONFIG.SERVICES.DEVICE + API_CONFIG.ENDPOINTS.V1.DEVICE_ONLINE
+  }
+
+  _positionUrl() {
+    return API_CONFIG.SERVICES.DEVICE + API_CONFIG.ENDPOINTS.V1.DEVICE_POSITION
   }
 
   /**
@@ -45,10 +98,12 @@ export class UploadService {
     network.getType({
       success: (data) => {
         this.isNetworkAvailable = data.available !== false
+        this._notifyNetworkChange(this.isNetworkAvailable)
         console.log(`[Upload] 网络状态: ${this.isNetworkAvailable ? '已连接' : '未连接'}`)
       },
       fail: (data, code) => {
         console.error(`[Upload] 获取网络状态失败: code=${code}`)
+        // 保持乐观默认，宁可请求失败后持久化重试，也不静默丢数据
       }
     })
 
@@ -56,6 +111,7 @@ export class UploadService {
     network.subscribe({
       callback: (data) => {
         this.isNetworkAvailable = data.available
+        this._notifyNetworkChange(this.isNetworkAvailable)
         console.log(`[Upload] 网络变化: ${data.available ? '已连接' : '已断开'}`)
         if (data.available) {
           this.retryPendingData()
@@ -65,6 +121,18 @@ export class UploadService {
         console.error(`[Upload] 网络监听失败: code=${code}`)
       }
     })
+
+    // 启动时补传一次持久化的报警（上次离线/失败遗留）
+    this._flushPendingAlarms()
+  }
+
+  /**
+   * 通知外部网络状态变化
+   */
+  _notifyNetworkChange(available) {
+    if (this.uploadCallback && typeof this.uploadCallback.onNetworkChange === 'function') {
+      this.uploadCallback.onNetworkChange(available)
+    }
   }
 
   // ============================================
@@ -178,7 +246,7 @@ export class UploadService {
       if (this.uploadMode === UPLOAD_MODE.MQTT) {
         // === MQTT 模式 ===
         this._uploadViaMQTT(
-          API_CONFIG.MQTT_TOPICS.VITAL(API_CONFIG.DEVICE_SN),
+          API_CONFIG.MQTT_TOPICS.VITAL(deviceBinding.getDeviceSN()),
           packet,
           'vital',
           successCallback,
@@ -187,7 +255,7 @@ export class UploadService {
       } else {
         // === HTTP 模式 ===
         this._uploadViaHTTP(
-          `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.VITAL_SIGN}`,
+          this._vitalUrl(),
           packet,
           'vital',
           successCallback,
@@ -207,9 +275,7 @@ export class UploadService {
     fetch.fetch({
       url: url,
       method: 'POST',
-      header: {
-        'Content-Type': 'application/json'
-      },
+      header: this._jsonHeader(),
       data: JSON.stringify(packet),
       responseType: 'json',
       success: (response) => {
@@ -234,29 +300,37 @@ export class UploadService {
    */
   _uploadViaMQTT(topic, packet, type, successCallback, failCallback) {
     const modeTag = '[MQTT]'
+    const fallback = () => {
+      this._uploadViaHTTP(
+        type === 'vital' ? this._vitalUrl() : this._alarmUrl(),
+        packet, type, successCallback, failCallback
+      )
+    }
 
     if (!this.mqttService) {
       console.error(`${modeTag} MQTT 服务未绑定，回退到 HTTP`)
-      this._uploadViaHTTP(
-        type === 'vital'
-          ? `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.VITAL_SIGN}`
-          : `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.ALARM_REPORT}`,
-        packet, type, successCallback, failCallback
-      )
+      fallback()
       return
     }
 
     this.logUpload(`mqtt_${type}`, { topic, packet })
 
-    const ok = this.mqttService.publish(topic, packet)
+    const ok = this.mqttService.publish(topic, packet, {
+      cache: false, // 未连接时直接由 fallback 走 HTTP，避免缓存重复发送
+      onSuccess: () => {
+        console.log(`${modeTag} ${type}上报成功 → ${topic}`)
+        if (successCallback) successCallback({ code: 0, mode: 'mqtt' })
+      },
+      onError: (error) => {
+        console.warn(`${modeTag} ${type}发布失败(${error})，回退 HTTP`)
+        fallback()
+      }
+    })
 
-    if (ok) {
-      console.log(`${modeTag} ${type}上报成功 → ${topic}`)
-      if (successCallback) successCallback({ code: 0, mode: 'mqtt' })
-    } else {
-      console.warn(`${modeTag} ${type}已缓存（等待MQTT连接）`)
-      // MQTT 未连接，消息已缓存，连接后会发送
-      if (successCallback) successCallback({ code: 0, mode: 'mqtt', cached: true })
+    if (!ok) {
+      // MQTT 未连接：直接走 HTTP，保证数据即时到达
+      console.warn(`${modeTag} ${type}MQTT 未连接，回退 HTTP`)
+      fallback()
     }
   }
 
@@ -269,8 +343,8 @@ export class UploadService {
     const now = new Date()
 
     return {
-      device_sn: API_CONFIG.DEVICE_SN,
-      elderly_id: API_CONFIG.ELDERLY_ID,
+      device_sn: deviceBinding.getDeviceSN(),
+      elderly_id: deviceBinding.getElderlyId(),
       timestamp: Date.now(),           // 毫秒时间戳，服务端 FROM_UNIXTIME(?/1000) 使用
       heart_rate: Math.round(data.heartRate || 0),
       spo2: Math.round(data.spo2 || 0),
@@ -302,55 +376,155 @@ export class UploadService {
    * 上传报警数据
    * 匹配服务器接口：POST /api/v1/alarms/report 或 MQTT device/{sn}/alarm
    * @param {Object} alarmPacket - 报警数据
+   * @param {Function} successCallback - 服务器确认收到后回调
+   * @param {Function} failCallback - 发送失败（已持久化，等待补传）后回调
    */
-  uploadAlarm(alarmPacket) {
+  uploadAlarm(alarmPacket, successCallback, failCallback) {
+    let finished = false
+    const done = (err) => {
+      if (finished) return
+      finished = true
+      if (err) {
+        // 失败：持久化，下次启动/网络恢复后自动补传，报警不丢
+        this._storePendingAlarm(alarmPacket)
+        if (failCallback) failCallback(err)
+      } else if (successCallback) {
+        successCallback()
+      }
+    }
+
+    // 实时通道：WebSocket 在线时立即下发报警指令（秒级送达）
+    this._sendAlarmViaCloud(alarmPacket)
+
     if (!this.isNetworkAvailable) {
-      this.pendingAlarms.push(alarmPacket)
-      console.log('[Upload] 网络不可用，报警已缓存')
+      console.log('[Upload] 网络不可用，报警已持久化待补传')
+      done('network_unavailable')
       return
     }
 
-    if (this.uploadMode === UPLOAD_MODE.MQTT) {
-      // === MQTT 模式 ===
+    // MQTT 模式且已连接：走 Topic device/{sn}/alarm，失败自动回退 HTTP
+    if (this.uploadMode === UPLOAD_MODE.MQTT && this.mqttService && this.mqttService.isConnected()) {
       this._uploadViaMQTT(
-        API_CONFIG.MQTT_TOPICS.ALARM(API_CONFIG.DEVICE_SN),
+        API_CONFIG.MQTT_TOPICS.ALARM(deviceBinding.getDeviceSN()),
         alarmPacket,
         'alarm',
-        (res) => {
-          console.log(`[MQTT] 报警上报成功: type=${alarmPacket.alarm_type} level=${alarmPacket.severity}`)
+        () => {
+          console.log(`[Upload] 报警上报成功(MQTT): type=${alarmPacket.alarm_type} level=${alarmPacket.severity}`)
+          done(null)
         },
         (error) => {
-          console.error(`[MQTT] 报警上报失败: ${error}`)
-          this.pendingAlarms.push(alarmPacket)
+          console.error(`[Upload] 报警上报失败(MQTT): ${error}`)
+          done(error || 'mqtt_failed')
         }
       )
-    } else {
-      // === HTTP 模式 ===
-      const url = `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.ALARM_REPORT}`
-      this.logUpload('alarm', alarmPacket)
+      return
+    }
 
-      fetch.fetch({
-        url: url,
-        method: 'POST',
-        header: {
-          'Content-Type': 'application/json'
-        },
-        data: JSON.stringify(alarmPacket),
-        responseType: 'json',
-        success: (response) => {
-          const res = response.data || response
-          if (res.code === 0 || res.code === 200 || response.code === 200) {
-            console.log(`[Upload] 报警上报成功: type=${alarmPacket.alarm_type} level=${alarmPacket.severity}`)
-          } else {
-            console.error(`[Upload] 报警上报失败: code=${res.code}`)
-            this.pendingAlarms.push(alarmPacket)
-          }
-        },
-        fail: (data, code) => {
-          console.error(`[Upload] 报警上报请求失败: code=${code}`)
-          this.pendingAlarms.push(alarmPacket)
+    // HTTP 模式（写入 alarm_records，保证报警不丢）
+    this._uploadAlarmHTTP(alarmPacket, done)
+  }
+
+  /**
+   * HTTP 上报报警（内部方法）
+   */
+  _uploadAlarmHTTP(alarmPacket, done) {
+    const url = this._alarmUrl()
+    this.logUpload('alarm', alarmPacket)
+
+    fetch.fetch({
+      url: url,
+      method: 'POST',
+      header: this._jsonHeader(),
+      data: JSON.stringify(alarmPacket),
+      responseType: 'json',
+      success: (response) => {
+        const res = response.data || response
+        const code = res.code !== undefined ? res.code : response.code
+        if (code === 0 || code === 200) {
+          console.log(`[Upload] 报警上报成功(HTTP): type=${alarmPacket.alarm_type} level=${alarmPacket.severity}`)
+          done(null)
+        } else {
+          console.error(`[Upload] 报警上报失败: code=${code}`)
+          done(`code=${code}`)
         }
-      })
+      },
+      fail: (data, code) => {
+        console.error(`[Upload] 报警上报请求失败: code=${code}`)
+        done(`request_failed=${code}`)
+      }
+    })
+  }
+
+  /**
+   * 报警持久化（写入 storage，页面销毁/重启后仍可补传）
+   */
+  _storePendingAlarm(alarmPacket) {
+    storage.get({
+      key: STORAGE_KEYS.ALARM_PENDING,
+      success: (data) => {
+        let list = []
+        if (data) {
+          try { list = JSON.parse(data) } catch (e) { list = [] }
+        }
+        if (!Array.isArray(list)) list = []
+        list.push(alarmPacket)
+        if (list.length > 50) list = list.slice(-50)
+        storage.set({
+          key: STORAGE_KEYS.ALARM_PENDING,
+          value: JSON.stringify(list),
+          success: () => {},
+          fail: () => {}
+        })
+      },
+      fail: () => {
+        storage.set({
+          key: STORAGE_KEYS.ALARM_PENDING,
+          value: JSON.stringify([alarmPacket]),
+          success: () => {},
+          fail: () => {}
+        })
+      }
+    })
+  }
+
+  /**
+   * 补传持久化的报警
+   */
+  _flushPendingAlarms() {
+    storage.get({
+      key: STORAGE_KEYS.ALARM_PENDING,
+      success: (data) => {
+        let list = []
+        if (data) {
+          try { list = JSON.parse(data) } catch (e) { list = [] }
+        }
+        if (!Array.isArray(list) || list.length === 0) return
+
+        console.log(`[Upload] 补传 ${list.length} 条持久化报警`)
+        // 先清空，失败的会重新入库，避免重复堆积
+        storage.delete({ key: STORAGE_KEYS.ALARM_PENDING, success: () => {}, fail: () => {} })
+
+        list.forEach((alarm) => {
+          this._sendAlarmViaCloud(alarm)
+          this._uploadAlarmHTTP(alarm, (err) => {
+            if (err) this._storePendingAlarm(alarm)
+          })
+        })
+      },
+      fail: () => {}
+    })
+  }
+
+  /**
+   * 通过 WebSocket 长连接下发报警指令
+   */
+  _sendAlarmViaCloud(alarmPacket) {
+    if (!this.cloudService) return false
+    try {
+      return this.cloudService.reportAlarm(alarmPacket)
+    } catch (e) {
+      console.warn(`[Upload] WebSocket 下发报警失败: ${e}`)
+      return false
     }
   }
 
@@ -365,15 +539,20 @@ export class UploadService {
       'abnormal': 'VITAL_ABNORMAL'
     }
 
+    // 无效体征（-1 / 空）统一上报 0，避免服务端出现负数
+    const hr = vitals && vitals.heartRate > 0 ? Math.round(vitals.heartRate) : 0
+    const ox = vitals && vitals.spo2 > 0 ? Math.round(vitals.spo2) : 0
+    const temp = vitals && vitals.temperature > 0 ? parseFloat(vitals.temperature.toFixed(1)) : 0
+
     const packet = {
-      device_sn: API_CONFIG.DEVICE_SN,
-      elderly_id: API_CONFIG.ELDERLY_ID,
+      device_sn: deviceBinding.getDeviceSN(),
+      elderly_id: deviceBinding.getElderlyId(),
       timestamp: Date.now(),
       alarm_type: typeMap[type] || type.toUpperCase(),
       severity: level,
-      heart_rate: vitals ? Math.round(vitals.heartRate || 0) : 0,
-      spo2: vitals ? Math.round(vitals.spo2 || 0) : 0,
-      temperature: vitals ? parseFloat((vitals.temperature || 0).toFixed(1)) : 0,
+      heart_rate: hr,
+      spo2: ox,
+      temperature: temp,
       battery: 85
     }
 
@@ -404,7 +583,7 @@ export class UploadService {
     if (!this.isNetworkAvailable || !location) return
 
     const packet = {
-      device_sn: API_CONFIG.DEVICE_SN,
+      device_sn: deviceBinding.getDeviceSN(),
       timestamp: Date.now(),
       latitude: location.latitude,
       longitude: location.longitude,
@@ -415,17 +594,17 @@ export class UploadService {
 
     if (this.uploadMode === UPLOAD_MODE.MQTT && this.mqttService) {
       this.mqttService.publish(
-        API_CONFIG.MQTT_TOPICS.POSITION(API_CONFIG.DEVICE_SN),
+        API_CONFIG.MQTT_TOPICS.POSITION(deviceBinding.getDeviceSN()),
         packet
       )
       console.log(`[MQTT] 位置上报: ${location.latitude}, ${location.longitude}`)
     } else {
       // HTTP 模式：POST 到服务器
-      const url = `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.DEVICE_POSITION}`
+      const url = this._positionUrl()
       fetch.fetch({
         url: url,
         method: 'POST',
-        header: { 'Content-Type': 'application/json' },
+        header: this._jsonHeader(),
         data: JSON.stringify(packet),
         responseType: 'json',
         success: () => {},
@@ -446,7 +625,7 @@ export class UploadService {
     if (!this.isNetworkAvailable) return
 
     const packet = {
-      device_sn: API_CONFIG.DEVICE_SN,
+      device_sn: deviceBinding.getDeviceSN(),
       timestamp: Date.now(),
       battery: batteryLevel >= 0 ? batteryLevel : 100,
       signal_strength: 72,
@@ -455,16 +634,16 @@ export class UploadService {
 
     if (this.uploadMode === UPLOAD_MODE.MQTT && this.mqttService) {
       this.mqttService.publish(
-        API_CONFIG.MQTT_TOPICS.HEARTBEAT(API_CONFIG.DEVICE_SN),
+        API_CONFIG.MQTT_TOPICS.HEARTBEAT(deviceBinding.getDeviceSN()),
         packet
       )
       console.log(`[MQTT] 心跳上报: battery=${packet.battery}%`)
     } else {
-      const url = `${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.DEVICE_HEARTBEAT}`
+      const url = this._heartbeatUrl()
       fetch.fetch({
         url: url,
         method: 'POST',
-        header: { 'Content-Type': 'application/json' },
+        header: this._jsonHeader(),
         data: JSON.stringify(packet),
         responseType: 'json',
         success: () => {},
@@ -529,13 +708,13 @@ export class UploadService {
       fail: () => {}
     })
 
-    // 重传报警数据
+    // 重传报警数据（内存 + 持久化）
     if (this.pendingAlarms.length > 0) {
-      console.log(`[Upload] 补传 ${this.pendingAlarms.length} 条缓存报警`)
       const alarms = [...this.pendingAlarms]
       this.pendingAlarms = []
-      alarms.forEach(alarm => this.uploadAlarm(alarm))
+      alarms.forEach(alarm => this._storePendingAlarm(alarm))
     }
+    this._flushPendingAlarms()
   }
 
   // ============================================
