@@ -1,19 +1,12 @@
 <template>
   <div class="container">
-    <!-- 顶部标题：菜单 + 云端连接状态 -->
+    <!-- 顶部标题：菜单 -->
     <div class="top-bar">
       <text class="menu-title">菜单</text>
-      <div class="cloud-bar">
-        <div class="cloud-dot {{ cloudWsConnected ? 'cloud-dot-online' : 'cloud-dot-offline' }}"></div>
-        <text class="cloud-text">{{ cloudStatusText }}</text>
-      </div>
     </div>
 
     <!-- 日期 -->
     <text class="date-text">{{ currentDate }}</text>
-
-    <!-- 今日签到状态（点击进入签到页） -->
-    <text class="signin-text {{ signinDone ? 'signin-done' : 'signin-todo' }}" onclick="openCheckIn">{{ signinText }}</text>
 
     <!-- 功能菜单 2x2 网格 -->
     <div class="menu-grid">
@@ -40,6 +33,7 @@
           </div>
           <text class="menu-name">运动</text>
         </div>
+      </div>
 
         <div class="menu-item" onclick="openSettings">
           <div class="menu-icon settings-icon">
@@ -97,52 +91,6 @@
   font-size: 26px;
   color: #7dd3fc;
   margin-bottom: 18px;
-}
-
-.signin-text {
-  font-size: 18px;
-  margin-bottom: 10px;
-}
-
-.signin-done {
-  color: #22c55e;
-}
-
-.signin-todo {
-  color: #f59e0b;
-}
-
-.cloud-bar {
-  flex-direction: row;
-  align-items: center;
-  margin-left: 10px;
-  padding-left: 10px;
-  padding-right: 10px;
-  padding-top: 3px;
-  padding-bottom: 3px;
-  border-radius: 12px;
-  background-color: rgba(255, 255, 255, 0.06);
-}
-
-.cloud-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 4px;
-  margin-right: 6px;
-  background-color: #f59e0b;
-}
-
-.cloud-dot-online {
-  background-color: #22c55e;
-}
-
-.cloud-dot-offline {
-  background-color: #f59e0b;
-}
-
-.cloud-text {
-  font-size: 12px;
-  color: #94a3b8;
 }
 
 .menu-grid {
@@ -354,18 +302,8 @@ export default {
   onShow() {
     // 重新加载设置，确保数据来源配置是最新的
     this.loadSettings()
-    // 自动签到：开机/回到首页立即本地签到，服务器可用后自动同步
-    this.autoCheckIn()
-    // 每次回到首页检查云端连接（登录 + WebSocket）
-    this.ensureCloudOnline()
-    // 刷新今日签到状态（从签到页返回时能看到变化）
-    this.refreshSigninStatus()
-    // 补传未同步到服务器的签到记录
-    this._flushPendingSignin()
-    // 早晨未签到时自动跳转到每日签到页（延迟判断，避免与自动签到竞态）
-    setTimeout(() => {
-      this.checkMorningCheckIn()
-    }, 1500)
+    // 早晨未签到时自动跳转到每日签到页
+    this.checkMorningCheckIn()
     // 重新加载上传模式（用户可能在设置页修改了）
     this._loadUploadModeConfig()
     // 立刻同步当前上传模式（避免异步竞态）
@@ -957,6 +895,27 @@ export default {
             fail: () => this.refreshSigninStatus()
           })
         })
+      },
+      fail: () => {}
+    })
+  },
+
+  /**
+   * 检查早晨签到：每天 06:00-10:00 未签到时自动跳转签到页
+   */
+  checkMorningCheckIn() {
+    const hour = new Date().getHours()
+    if (hour < 6 || hour >= 10) return
+
+    const today = new Date().toDateString()
+    storage.get({
+      key: STORAGE_KEYS.CHECKIN_DATE,
+      success: (data) => {
+        if (data !== today) {
+          router.push({
+            uri: '/pages/checkin'
+          })
+        }
       },
       fail: () => {}
     })

@@ -76,19 +76,7 @@ export const STORAGE_KEYS = {
   UPLOAD_MODE: 'upload_mode',
   MQTT_STATUS: 'mqtt_status',
   MQTT_CMD: 'mqtt_cmd',
-  CHECKIN_DATE: 'checkin_date',
-  // 签到记录（日期/时间/是否已同步服务器）
-  SIGNIN_RECORD: 'signin_record',
-  // 待同步到服务器的签到队列
-  SIGNIN_PENDING: 'signin_pending',
-  // 登录会话（access_token / refresh_token / 过期时间）
-  AUTH_SESSION: 'auth_session',
-  // 登录账号（可选，覆盖默认账号）
-  AUTH_CREDENTIALS: 'auth_credentials',
-  // 云端连接状态（供设置页展示）
-  CLOUD_STATUS: 'cloud_status',
-  // 设备绑定信息（序列号 / 绑定方式 / 绑定时间）
-  DEVICE_BINDING: 'device_binding'
+  CHECKIN_DATE: 'checkin_date'
 }
 
 // ============================================

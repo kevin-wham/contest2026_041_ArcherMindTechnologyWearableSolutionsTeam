@@ -3,7 +3,6 @@
     <text class="greeting">{{ greeting }}</text>
     <text class="checkin-time">{{ statusText }}</text>
     <text class="sync-text" if="{{ syncText }}">{{ syncText }}</text>
-
     <div class="checkin-btn" onclick="onCheckIn">
       <text class="checkin-text" if="{{ !checkedIn }}">我很好</text>
       <text class="checkin-text" if="{{ checkedIn }}">已签到</text>
@@ -40,13 +39,7 @@
   margin-bottom: 60px;
 }
 
-.sync-text {
-  font-size: 20px;
-  color: #dcfce7;
-  margin-top: -40px;
-  margin-bottom: 40px;
-}
-
+ dev-ai-contest-2026
 .checkin-btn {
   flex-direction: row;
   align-items: center;
@@ -76,27 +69,13 @@
 <script>
 import router from '@system.router'
 import storage from '@system.storage'
-import prompt from '@system.prompt'
 import { STORAGE_KEYS } from '../../utils/constants'
-import signinService from '../../services/SigninService'
 
 export default {
   private: {
     greeting: '早上好！',
     currentTime: '08:00',
-    checkedIn: false,
-    checkinTime: '',
-    submitting: false,
-    syncText: ''
-  },
-
-  computed: {
-    statusText() {
-      if (!this.checkedIn) {
-        return this.currentTime + ' 签到'
-      }
-      return this.checkinTime ? this.checkinTime + ' 已签到' : '今日已签到'
-    }
+    checkedIn: false
   },
 
   onInit() {
@@ -129,41 +108,15 @@ export default {
     this.currentTime = `${hours}:${minutes}`
   },
 
-  /**
-   * 读取今日签到状态（优先新记录，兼容旧版 checkin_date）
-   */
   loadCheckInStatus() {
     const today = new Date().toDateString()
-
     storage.get({
-      key: STORAGE_KEYS.SIGNIN_RECORD,
+      key: STORAGE_KEYS.CHECKIN_DATE,
       success: (data) => {
-        if (data) {
-          try {
-            const record = JSON.parse(data)
-            if (record && record.date === today) {
-              this.checkedIn = true
-              this.checkinTime = record.time || ''
-              return
-            }
-          } catch (e) {
-            console.warn('[CheckIn] 签到记录解析失败')
-          }
-        }
-        this.checkedIn = false
-        this.checkinTime = ''
+        this.checkedIn = data === today
       },
       fail: () => {
-        // 兼容旧版本只存了 checkin_date
-        storage.get({
-          key: STORAGE_KEYS.CHECKIN_DATE,
-          success: (value) => {
-            this.checkedIn = value === today
-          },
-          fail: () => {
-            this.checkedIn = false
-          }
-        })
+        this.checkedIn = false
       }
     })
   },
@@ -173,137 +126,18 @@ export default {
       router.back()
       return
     }
-    if (this.submitting) return
-    this.submitting = true
 
-    const now = new Date()
-    const today = now.toDateString()
-    const hh = now.getHours().toString().padStart(2, '0')
-    const mm = now.getMinutes().toString().padStart(2, '0')
-    const time = `${hh}:${mm}`
-
-    const record = {
-      date: today,
-      time: time,
-      timestamp: now.getTime(),
-      method: 'manual',
-      synced: false
-    }
-
-    // 1) 立即刷新界面，不依赖 storage 回调（避免点击后页面无变化）
-    this.checkedIn = true
-    this.checkinTime = time
-    this.submitting = false
-
-    prompt.showToast({
-      message: '签到成功',
-      duration: 1500
-    })
-
-    // 2) 持久化签到记录
-    storage.set({
-      key: STORAGE_KEYS.SIGNIN_RECORD,
-      value: JSON.stringify(record),
-      success: () => {},
-      fail: (data, code) => {
-        console.error(`[CheckIn] 保存签到记录失败: code=${code}`)
-        // 写入失败时回滚界面状态
-        this.checkedIn = false
-        this.checkinTime = ''
-        prompt.showToast({
-          message: '签到保存失败，请重试',
-          duration: 1800
-        })
-      }
-    })
-
-    // 3) 兼容旧逻辑（首页早晨自动跳转依赖 checkin_date）
+    const today = new Date().toDateString()
     storage.set({
       key: STORAGE_KEYS.CHECKIN_DATE,
       value: today,
-      success: () => {},
-      fail: () => {}
-    })
-
-    // 4) 入队，等待首页在 MQTT 连接后补传服务器（HTTP 上报失败时兜底）
-    this.enqueuePendingSignin(record)
-
-    // 5) 立即上报服务器，页面停留在"已签到"状态直到同步完成
-    let returned = false
-    const goBack = () => {
-      if (returned) return
-      returned = true
-      router.back()
-    }
-
-    this.syncText = '正在同步签到…'
-    signinService.report(record, (err) => {
-      if (err) {
-        this.syncText = '网络异常，已本地保存'
-        console.warn('[CheckIn] 签到同步失败: ' + (err.message || err))
-      } else {
-        this.syncText = '已同步到服务器'
-        this.markRecordSynced(record)
-        storage.delete({
-          key: STORAGE_KEYS.SIGNIN_PENDING,
-          success: () => {},
-          fail: () => {}
-        })
-      }
-      setTimeout(goBack, 900)
-    })
-
-    // 超时兜底：网络很慢时也返回上一页
-    setTimeout(goBack, 5000)
-  },
-
-  /**
-   * 标记本地签到记录已同步到服务器
-   */
-  markRecordSynced(record) {
-    const synced = Object.assign({}, record, { synced: true })
-    storage.set({
-      key: STORAGE_KEYS.SIGNIN_RECORD,
-      value: JSON.stringify(synced),
-      success: () => {},
-      fail: () => {}
-    })
-  },
-
-  /**
-   * 签到记录加入待同步队列（服务端签到目前走 MQTT device/{sn}/signin）
-   */
-  enqueuePendingSignin(record) {
-    storage.get({
-      key: STORAGE_KEYS.SIGNIN_PENDING,
-      success: (data) => {
-        let list = []
-        if (data) {
-          try {
-            list = JSON.parse(data)
-          } catch (e) {
-            list = []
-          }
-        }
-        if (!Array.isArray(list)) list = []
-        list.push(record)
-        if (list.length > 50) list = list.slice(-50)
-
-        storage.set({
-          key: STORAGE_KEYS.SIGNIN_PENDING,
-          value: JSON.stringify(list),
-          success: () => {},
-          fail: () => {}
-        })
+      success: () => {
+        this.checkedIn = true
+        setTimeout(() => {
+          router.back()
+        }, 800)
       },
-      fail: () => {
-        storage.set({
-          key: STORAGE_KEYS.SIGNIN_PENDING,
-          value: JSON.stringify([record]),
-          success: () => {},
-          fail: () => {}
-        })
-      }
+      fail: () => {}
     })
   }
 }
