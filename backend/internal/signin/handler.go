@@ -436,5 +436,16 @@ func ProxyCheckin(c *gin.Context) {
 	ctx := context.Background()
 	redis.CacheHelper.Set(ctx, redis.Key(redis.KeySigninToday, req.ElderlyID), "1", 24*time.Hour)
 
+	// 🔔 实时推送：签到成功后通知前端刷新签到列表/看板签到率
+	redis.PublishWS("signin_notify", gin.H{
+		"elderly_id":  req.ElderlyID,
+		"signin_time": time.Now().Format(time.RFC3339),
+		"method":      "proxy",
+	})
+	redis.PublishWS("dashboard_refresh", gin.H{
+		"reason":     "signin",
+		"elderly_id": req.ElderlyID,
+	})
+
 	c.JSON(http.StatusOK, utils.Success(gin.H{"message": "代签成功"}))
 }

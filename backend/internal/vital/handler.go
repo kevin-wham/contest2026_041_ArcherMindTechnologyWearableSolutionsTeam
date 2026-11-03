@@ -148,17 +148,38 @@ func HandleVitalSignReport(c *gin.Context) {
 		).Scan(&elderlyID)
 	}
 
+	// 采样时间：设备可能不带 timestamp，reported_at 为 NOT NULL，缺失时用服务器当前时间兜底
+	reportedAtMs := int64(0)
+	if v := safeGetFloat(body, "timestamp"); v != nil {
+		if f, ok := v.(float64); ok && f > 0 {
+			if f > 1e12 { // 毫秒时间戳
+				reportedAtMs = int64(f)
+			} else {
+				reportedAtMs = int64(f * 1000)
+			}
+		}
+	}
+	if reportedAtMs <= 0 {
+		reportedAtMs = time.Now().UnixMilli()
+	}
+
 	// 写入 MySQL vital_signs 表
 	if elderlyID != "" {
-		database.DB.Exec(
+		if _, err := database.DB.Exec(
 			`INSERT INTO vital_signs (elderly_id, device_id, heart_rate, spo2, temperature,
 			 steps, activity_level, posture, reported_at, created_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, FROM_UNIXTIME(?/1000), NOW())`,
 			elderlyID, deviceSN,
 			safeGetFloat(body, "heart_rate"), safeGetFloat(body, "spo2"), safeGetFloat(body, "temperature"),
 			safeGetFloat(body, "steps"), safeGetFloat(body, "activity_level"), safeGetString(body, "posture"),
-			safeGetFloat(body, "timestamp"),
-		)
+			reportedAtMs,
+		); err != nil {
+			// 落库失败不再静默：前端会因此拿不到最新体征
+			logger.Log.Error("[HTTP] Insert vital_signs failed",
+				zap.String("device_sn", deviceSN),
+				zap.String("elderly_id", elderlyID),
+				zap.Error(err))
+		}
 	}
 
 	// 更新 Redis 最新体征缓存
@@ -167,6 +188,26 @@ func HandleVitalSignReport(c *gin.Context) {
 		latestKey := redis.Key(redis.KeyVitalSigns, elderlyID)
 		vitalJSON, _ := json.Marshal(body)
 		redis.CacheHelper.Set(ctx, latestKey, string(vitalJSON), 2*time.Minute)
+	}
+
+	// 🔔 实时推送：手表 HTTP 上报不经过 MQTT，需主动广播到前端页面
+	// 前端 wsStore 收到 vital_update 后更新 latestVitals 并派发 ws:message 事件
+	if elderlyID != "" {
+		redis.PublishWS("vital_update", gin.H{
+			"elderly_id":  elderlyID,
+			"device_sn":   deviceSN,
+			"heart_rate":  safeGetFloat(body, "heart_rate"),
+			"spo2":        safeGetFloat(body, "spo2"),
+			"temperature": safeGetFloat(body, "temperature"),
+			"steps":       safeGetFloat(body, "steps"),
+			"timestamp":   reportedAtMs / 1000,
+		})
+		// 同时通知看板立即刷新统计
+		redis.PublishWS("dashboard_refresh", gin.H{
+			"reason":     "vital_update",
+			"elderly_id": elderlyID,
+			"device_sn":  deviceSN,
+		})
 	}
 
 	c.JSON(http.StatusOK, utils.Success(gin.H{"message": "体征数据上报成功"}))

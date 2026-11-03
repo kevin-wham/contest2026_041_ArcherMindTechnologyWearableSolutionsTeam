@@ -575,6 +575,26 @@ func HandleAlarmReport(c *gin.Context) {
 	score := float64(int64(utils.SeverityScore(severity))*1e12 + time.Now().UnixNano())
 	redis.Client.ZAdd(ctx, redis.KeyAlarmQueue, goredis.Z{Score: score, Member: id})
 
+	// 🔔 实时推送：HTTP 上报不经过 MQTT，需主动广播到前端（报警页/看板立即刷新）
+	redis.PublishWS("new_alarm", gin.H{
+		"alarm_id":    id,
+		"elderly_id":  elderlyID,
+		"device_sn":   deviceSN,
+		"alarm_type":  alarmType,
+		"severity":    severity,
+		"level":       severity,
+		"description": alarmType,
+		"heart_rate":  safeGet(rawMap, "heart_rate"),
+		"spo2":        safeGet(rawMap, "spo2"),
+		"temperature": safeGet(rawMap, "temperature"),
+		"timestamp":   time.Now().Unix(),
+	})
+	redis.PublishWS("dashboard_refresh", gin.H{
+		"reason":    "new_alarm",
+		"severity":  severity,
+		"alarm_id":  id,
+	})
+
 	c.JSON(http.StatusOK, utils.Success(gin.H{
 		"message":  "报警上报成功",
 		"alarm_id": id,

@@ -1,6 +1,7 @@
 package websocket
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"elderly-health-backend/internal/shared/logger"
 	"elderly-health-backend/internal/shared/middleware"
 	"elderly-health-backend/internal/shared/mqtt"
+	"elderly-health-backend/internal/shared/redis"
 )
 
 var upgrader = websocket.Upgrader{
@@ -216,7 +218,10 @@ func StartHub(jwtSecret string) *Hub {
 	// 订阅 MQTT topic（桥接到 WebSocket）
 	go hub.subscribeMQTT()
 
-	logger.Log.Info("websocket-service Hub started with MQTT subscription")
+	// 订阅 Redis 广播频道（HTTP 上报路径的实时推送）
+	go hub.subscribeRedisBroadcast()
+
+	logger.Log.Info("websocket-service Hub started with MQTT/Redis subscription")
 
 	return hub
 }
@@ -281,6 +286,48 @@ func (h *Hub) run() {
 
 		case <-h.stopChan:
 			return
+		}
+	}
+}
+
+// subscribeRedisBroadcast 订阅 Redis 广播频道并桥接到 WebSocket
+// 用于 HTTP 上报路径（手表/模拟器 POST /v1/vitals/sign、/v1/alarms/report 等）
+// 这些数据不经过 MQTT，需要各服务写库成功后主动 publish
+func (h *Hub) subscribeRedisBroadcast() {
+	if redis.Client == nil {
+		logger.Log.Warn("Redis client not available, skipping WS broadcast subscription")
+		return
+	}
+
+	pubsub := redis.Client.Subscribe(context.Background(), redis.ChannelWSBroadcast)
+	defer pubsub.Close()
+
+	if _, err := pubsub.Receive(context.Background()); err != nil {
+		logger.Log.Error("Failed to subscribe Redis WS broadcast channel", zap.Error(err))
+		return
+	}
+	logger.Log.Info("Subscribed Redis WS broadcast channel",
+		zap.String("channel", redis.ChannelWSBroadcast))
+
+	ch := pubsub.Channel()
+	for {
+		select {
+		case <-h.stopChan:
+			return
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			if len(msg.Payload) == 0 {
+				continue
+			}
+			// 消息体已是完整 WSMessage JSON，直接广播
+			select {
+			case h.broadcast <- []byte(msg.Payload):
+			case <-h.stopChan:
+				return
+			}
+			logger.Log.Debug("Bridged Redis→WS broadcast", zap.Int("size", len(msg.Payload)))
 		}
 	}
 }
